@@ -56,10 +56,17 @@ fi
 [ -n "${TS_KEY:-}" ] || die "no Tailscale auth key"
 printf '%s' "$TS_KEY" > "$DIR/tailscale.key"; chmod 600 "$DIR/tailscale.key"
 
-HOST="${HOSTNAME:-$(getprop ro.serialno 2>/dev/null | tr -cd 'A-Za-z0-9')}"
-[ -n "$HOST" ] || HOST="phone"
+# NOT $HOSTNAME: that is a shell builtin already set to 'localhost' on Termux, so
+# ${HOSTNAME:-...} never reaches the fallback and every phone would join as
+# 'localhost'. Use an explicit TS_HOSTNAME override, else the serial, else random.
+HOST="${TS_HOSTNAME:-}"
+[ -n "$HOST" ] || HOST="$(getprop ro.serialno 2>/dev/null | tr -cd 'A-Za-z0-9')"
+[ -n "$HOST" ] || HOST="phone-$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
 say "joining tailnet as '$HOST'"
-tailscale-cli up --auth-key="$TS_KEY" --hostname="$HOST" --accept-routes=false --accept-dns=false \
+# </dev/null: this script is often run as `curl … | bash`, so its stdin IS the
+# script. tailscale reads stdin, which would eat the rest of the script and derail
+# parsing ("bash: <garbage>: No such file or directory"). Feed it /dev/null.
+tailscale-cli up --auth-key="$TS_KEY" --hostname="$HOST" --accept-routes=false --accept-dns=false </dev/null \
   || die "tailscale up failed (bad/expired key?)"
 
 # ---- 3. hub URL + pull the auto-configured installer ----------------------
@@ -75,7 +82,7 @@ if ! curl -fsS --socks5-hostname "127.0.0.1:$SOCKS" -m 20 "$HUB/setup.sh" -o "$t
   die "cannot reach the hub over the tailnet. Is hub.py running and is this phone approved in the Tailscale admin?"
 fi
 say "installing watchdog"
-bash "$tmp" || die "setup.sh failed"
+bash "$tmp" </dev/null || die "setup.sh failed"
 rm -f "$tmp"
 
 # ---- 4. boot autostart ----------------------------------------------------
@@ -87,7 +94,7 @@ fi
 
 # ---- 5. start it ----------------------------------------------------------
 say "starting the watchdog"
-su 0 /system/bin/sh -c "export HOME='$HOME' && export PATH=\$PATH:$PREFIX/bin && cd '$DIR' && nohup bash roblox-watchdog.sh '$DIR/watchdog.conf' >> '$DIR/run.log' 2>&1 &" 2>/dev/null
+su 0 /system/bin/sh -c "export HOME='$HOME' && export PATH=\$PATH:$PREFIX/bin && cd '$DIR' && nohup bash roblox-watchdog.sh '$DIR/watchdog.conf' >> '$DIR/run.log' 2>&1 &" </dev/null 2>/dev/null
 
 cat <<DONE
 
