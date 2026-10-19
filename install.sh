@@ -27,9 +27,34 @@ mkdir -p "$DIR"
 
 # ---- 1. dependencies ------------------------------------------------------
 say "installing packages"
+PKGS="git curl coreutils sed grep procps inetutils termux-api sqlite termux-services"
+OFFICIAL_MAIN="https://packages.termux.dev/apt/termux-main"
 pkg update -y >/dev/null 2>&1 || true
-pkg install -y git curl coreutils sed grep procps inetutils termux-api sqlite termux-services >/dev/null \
-  || die "package install failed (check your network / mirror)"
+# shellcheck disable=SC2086
+if ! pkg install -y $PKGS >/dev/null; then
+  # A community mirror mid-sync fails with "File has unexpected size ... Mirror
+  # sync in progress?" and stays broken until it finishes. Point the main repo
+  # at the official Termux server (old file kept as .bak) and retry once.
+  # TERMUX_PKG_NO_MIRROR_SELECT stops pkg from rotating to a random mirror
+  # again (pkg's select_mirror rewrites the repo file on every install/update
+  # otherwise). Newer Termux keeps the main repo in sources.list.d/main.sources
+  # (deb822); older ones in sources.list.
+  say "package install failed; switching to the official Termux mirror and retrying"
+  SRC822="$PREFIX/etc/apt/sources.list.d/main.sources"
+  SRC="$PREFIX/etc/apt/sources.list"
+  if [ -f "$SRC822" ]; then
+    cp -f "$SRC822" "$SRC822.bak"
+    sed -i "s|^\([[:space:]]*URIs:\).*|\1 $OFFICIAL_MAIN|" "$SRC822"
+  else
+    [ -f "$SRC" ] && cp -f "$SRC" "$SRC.bak"
+    echo "deb $OFFICIAL_MAIN stable main" > "$SRC"
+  fi
+  export TERMUX_PKG_NO_MIRROR_SELECT=1
+  pkg update -y >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  pkg install -y $PKGS >/dev/null \
+    || die "package install failed on the official mirror too (check your network)"
+fi
 
 # ---- 2. Tailscale (PIE Android build) ------------------------------------
 ts_ok(){ command -v tailscaled-start >/dev/null 2>&1 && tailscale version >/dev/null 2>&1; }
@@ -41,11 +66,22 @@ if ! ts_ok; then
 fi
 ts_ok || die "tailscale still not runnable (unexpected e_type means a non-PIE binary slipped in)"
 
-# pin SOCKS port + start daemon
+# pin SOCKS port + keep the proxy OPEN + start the daemon. bropines
+# tailscale-termux >=1.102.4 defaults the SOCKS5 proxy to require a password AND
+# ships a runsv service that starts its own tailscaled on 1055 without reading this
+# .env (so it demands auth and squats the port). Our curl to the hub sends no
+# credentials, so without NO_AUTH the very next step (fetch setup.sh over SOCKS)
+# dies with `curl (97) No authentication method was acceptable`. Set NO_AUTH,
+# disable that service, then start our own daemon.
 mkdir -p "$HOME/.tailscale"
-echo "TS_SOCKS5_PORT=$SOCKS" > "$HOME/.tailscale/.env"
+printf 'TS_SOCKS5_PORT=%s\nTS_SOCKS5_NO_AUTH=1\n' "$SOCKS" > "$HOME/.tailscale/.env"
+command -v sv-disable >/dev/null 2>&1 && sv-disable tailscaled >/dev/null 2>&1 || true
+command -v sv >/dev/null 2>&1 && { sv down tailscaled >/dev/null 2>&1 || true; sleep 1; }
 say "starting tailscaled (userspace, socks5 127.0.0.1:$SOCKS)"
-pgrep -f "tailscaled.*$HOME/.tailscale" >/dev/null 2>&1 || tailscaled-start >/dev/null 2>&1
+if ! pgrep -f "tailscaled.*$HOME/.tailscale" >/dev/null 2>&1; then
+  rm -f "$HOME/.tailscale/tailscaled.sock" 2>/dev/null
+  tailscaled-start >/dev/null 2>&1
+fi
 for _ in $(seq 1 20); do [ -S "$HOME/.tailscale/tailscaled.sock" ] && break; sleep 0.5; done
 
 # auth key
